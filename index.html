@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AICO Voice</title>
   <style>
     body { font: 14px system-ui, sans-serif; max-width: 900px; margin: 24px auto; }
@@ -28,11 +29,39 @@
     .qa { border-bottom: 1px solid #eee; padding: 8px 0; }
     .qa .qline { font-weight: 600; }
     .qa .aline { margin-top: 4px; white-space: pre-wrap; }
+    /* Touch-friendly buttons */
+    button {
+      font: inherit;
+      padding: 0.8rem 1rem;          /* bigger tap target */
+      min-height: 44px;              /* WCAG min touch size */
+      border-radius: 0.6rem;
+      border: 1px solid #d1d5db;
+      background: #111827;
+      color: #fff;
+    }
+    button:disabled { opacity: .55; }
+
+    /* Wrap buttons nicely */
+    .controls { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+
+    /* Make the page comfy on small screens */
+    @media (max-width: 640px) {
+      body { max-width: 100%; margin: 12px; font-size: 16px; line-height: 1.5; }
+      #log { height: 40vh; }                      /* taller scroll box on phones */
+      button { flex: 1 1 48%; }                   /* two buttons side-by-side */
+      .small { font-size: 13px; }
+    }
+
+    /* Very small screens: stack buttons */
+    @media (max-width: 420px) {
+      .controls { flex-direction: column; align-items: stretch; }
+      button { width: 100%; }
+    }
   </style>
 </head>
 <body>
   <h2>🎤 AICO Voice</h2>
-  <p>
+  <p class="controls">
     <button id="startBtn">Start Listening</button>
     <button id="stopBtn" disabled>Stop</button>
     <span id="state" class="small"></span>

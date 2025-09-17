@@ -1,0 +1,246 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Voice Q&A with RAG</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 900px; margin: 24px auto; }
+    .small { color: #666; font-size: 12px; }
+    /* Top box: fixed height + scrollbar */
+    #log {
+      height: 260px;
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: .25rem;
+      padding: .6rem .75rem;
+    }
+    /* Single flowing paragraph */
+    #para { white-space: pre-wrap; line-height: 1.35; }
+    /* Inline highlight for questions */
+    .q {
+      background: #eef2ff;
+      border-radius: .25rem;
+      padding: 0 2px;
+      font-weight: 600;
+    }
+    /* Answers list */
+    .qa { border-bottom: 1px solid #eee; padding: 8px 0; }
+    .qa .qline { font-weight: 600; }
+    .qa .aline { margin-top: 4px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>🎤 AICO Voice</h2>
+  <p>
+    <button id="startBtn">Start Listening</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <span id="state" class="small"></span>
+  </p>
+
+  <!-- Top transcript box (single flowing paragraph) -->
+  <div id="log"><div id="para"></div></div>
+
+  <h3>Answers</h3>
+  <div id="answers"></div>
+
+  <!-- Azure Speech SDK -->
+  <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+  <script>
+    const API_BASE = "https://aico-voice-gmb0b9bwajeucmhb.eastus2-01.azurewebsites.net/api";   // change after deploy
+    const ANSWER_KEY = "";                           // set if /answer has auth
+
+    let recognizer = null;
+    let recognizing = false;
+    let lastChunk = "";        // de-dupe consecutive repeats
+
+    // ---------------- helpers ----------------
+    function setStatus(msg){ document.getElementById('state').textContent = String(msg || ''); }
+
+    // Highlight rules
+    function isLikelyQuestion(t) {
+      const s = (t || "").trim();
+      if (!s) return false;
+      if (/[?？]$/.test(s)) return true;  // ASCII ? or full-width ？
+      return /^(who|what|when|where|why|how|which|can|do|does|did|is|are|should|could|would|may)\b/i.test(s)
+          || /(吗|么|呢|是不是|为何|为什么|怎样|怎么|多少|几|哪|是否|可不可以|能不能)[^。?!？]*$/u.test(s);
+    }
+
+    // normalize to exactly ONE ASCII "?" when sending to /answer (display stays as-is)
+    function normalizeQuestionMark(t) {
+      return (t || "").replace(/[?？\s]*$/u, m => m ? "?" : "");
+    }
+
+    // Escape to safely inject into HTML
+    function escapeHtml(s) {
+      return (s || "").replace(/[&<>"']/g, c => ({
+        "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+      }[c]));
+    }
+
+    // NEW: if a fragment is mostly English letters, convert Chinese full-width punctuation → ASCII.
+function normalizePunctuationForEnglish(s) {
+  const latin = (s.match(/[A-Za-z]/g) || []).length;
+  const cjk   = (s.match(/[\u4E00-\u9FFF]/g) || []).length;
+
+  // Only normalize if the fragment is mostly English
+  if (latin >= cjk) {
+    let t = s
+      // Convert full-width → ASCII
+      .replace(/，/g, ',')
+      .replace(/。/g, '.')
+      .replace(/：/g, ':')
+      .replace(/；/g, ';')
+      .replace(/！/g, '!')
+      .replace(/？/g, '?')
+      .replace(/（/g, '(').replace(/）/g, ')')
+      .replace(/【/g, '[').replace(/】/g, ']')
+      .replace(/\u3000/g, ' ');
+
+    // Remove extra spaces *before* punctuation
+    t = t.replace(/\s+([,.;:!?])/g, '$1');
+
+    // Ensure exactly ONE space *after* punctuation when followed by a letter or "("
+    // e.g., "Pop.The" -> "Pop. The", "numbers,positive" -> "numbers, positive"
+    t = t.replace(/([,.;:!?])([A-Za-z(])/g, '$1 $2');
+
+    // Collapse multiple spaces
+    t = t.replace(/[ \t]{2,}/g, ' ');
+    return t;
+  }
+  return s;
+}
+
+
+    // Append recognized text to one flowing paragraph and lightly highlight questions
+    function appendContinuous(text) {
+      let raw = (text || "").trim();
+      if (!raw || raw === lastChunk) return;     // skip empty/duplicate
+      lastChunk = raw;
+
+      // Fix punctuation for English-only fragments produced under zh-CN
+      const fixed = normalizePunctuationForEnglish(raw);
+
+      const para = document.getElementById('para');
+      const lastChar = para.textContent.slice(-1);
+      const startChar = fixed[0];
+
+      // Insert a space between English fragments; not before/after CJK punctuation
+        const endIsCJKPunct = /[。！？、]$/.test(lastChar);
+        const startIsPunct  = /^[\s,.!?，。！？、）)]/.test(startChar);
+        const endsWithSpace = /\s$/.test(para.textContent);
+
+        // NEW: also add a space when previous chunk ends with English sentence punctuation
+        const endIsEngPunct = /[.,!?;:]$/.test(lastChar);
+        const nextStartsEng = /^[A-Za-z(]/.test(startChar);
+
+        // Existing rule for joining English words across chunks
+        const englishGlue   = /[A-Za-z0-9)]$/.test(lastChar) && /^[A-Za-z0-9(]/.test(startChar);
+
+        const needsSpace = (
+        para.textContent &&
+        !endIsCJKPunct &&
+        !startIsPunct &&
+        !endsWithSpace &&
+        (englishGlue || (endIsEngPunct && nextStartsEng))
+        );
+      if (needsSpace) para.appendChild(document.createTextNode(' '));
+
+      if (isLikelyQuestion(fixed)) {
+        const span = document.createElement('span');
+        span.className = 'q';
+        span.textContent = fixed;
+        para.appendChild(span);
+      } else {
+        para.appendChild(document.createTextNode(fixed));
+      }
+
+      // autoscroll
+      const log = document.getElementById('log');
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function addQA(q, a) {
+      const wrap = document.createElement('div'); wrap.className = 'qa';
+      const qEl = document.createElement('div'); qEl.className = 'qline'; qEl.textContent = "Q: " + q;
+      const aEl = document.createElement('div'); aEl.className = 'aline'; aEl.textContent = "A: " + a;
+      wrap.appendChild(qEl); wrap.appendChild(aEl);
+      document.getElementById('answers').prepend(wrap);
+    }
+
+    // ---------------- Speech wiring ----------------
+    async function getSpeechConfig() {
+      const r = await fetch(`${API_BASE}/speechToken`);
+      if (!r.ok) throw new Error(`speechToken HTTP ${r.status}`);
+      const { token, region } = await r.json();
+      const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, region);
+      // Keep zh-CN (works well for bilingual demo). We fix punctuation for English below.
+      speechConfig.speechRecognitionLanguage = "zh-CN";
+      return speechConfig;
+    }
+
+    async function start() {
+      if (recognizing) return;
+      recognizing = true;
+      setStatus("requesting mic…");
+
+      const audioConfig  = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+      const speechConfig = await getSpeechConfig();
+      recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+
+      recognizer.recognizing = (s, e) => {
+        setStatus("listening… " + (e.result.text || ""));
+      };
+
+      recognizer.recognized = async (s, e) => {
+        if (e.result.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
+          const text = e.result.text || "";
+          appendContinuous(text);
+
+          // If it's a question, send to /answer
+          if (isLikelyQuestion(text)) {
+            const toSend = normalizeQuestionMark(normalizePunctuationForEnglish(text));
+            const langHint = /[\u4E00-\u9FFF]/u.test(text) ? "Chinese (Simplified)" : "English";
+            const url = ANSWER_KEY
+              ? `${API_BASE}/answer?code=${encodeURIComponent(ANSWER_KEY)}`
+              : `${API_BASE}/answer`;
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ question: toSend, lang: langHint, format: "text" })
+            });
+            const data = await res.json();
+            addQA(toSend, data.answer ?? JSON.stringify(data));
+          }
+        }
+      };
+
+      recognizer.sessionStarted = () => setStatus("listening…");
+      recognizer.sessionStopped = () => setStatus("stopped");
+      recognizer.canceled = (_, e) => setStatus("canceled: " + (e.errorDetails || e));
+
+      recognizer.startContinuousRecognitionAsync(
+        () => { setStatus("listening…"); startBtn.disabled = true; stopBtn.disabled = false; },
+        (err) => { setStatus("start error: " + err); recognizing = false; }
+      );
+    }
+
+    function stop() {
+      if (!recognizer) return;
+      recognizer.stopContinuousRecognitionAsync(() => {
+        recognizing = false;
+        setStatus("stopped");
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        recognizer.close(); recognizer = null;
+      });
+    }
+
+    // buttons
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    startBtn.onclick = start;
+    stopBtn.onclick  = stop;
+  </script>
+</body>
+</html>
